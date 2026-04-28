@@ -11,6 +11,8 @@ import { chatService } from './chatService'
 import { querySnsTimeline } from './httpApiFacade'
 import { imageDecryptService } from './imageDecryptService'
 import { videoService } from './videoService'
+import { groupAnalyticsService } from './groupAnalyticsService'
+import { executeMcpTool } from './mcp/dispatcher'
 
 interface ApiEnvelopeSuccess<T> {
   success: true
@@ -44,6 +46,14 @@ interface HttpApiSettings {
 
 type ContactType = 'friend' | 'group' | 'official' | 'former_friend' | 'other'
 type SessionTypeFilter = 'friend' | 'group' | 'official' | 'other'
+
+interface ExportGroupMetadata {
+  sessionId: string
+  displayName: string
+  memberCount: number
+  avatarUrl?: string
+  sortTimestamp?: number
+}
 
 class HttpApiService {
   private server: http.Server | null = null
@@ -158,6 +168,7 @@ class HttpApiService {
         { method: 'GET', path: '/v1/messages', desc: '会话消息' },
         { method: 'GET', path: '/v1/contacts', desc: '联系人列表' },
         { method: 'GET', path: '/v1/sns', desc: '朋友圈时间线' },
+        { method: 'POST', path: '/v1/export', desc: 'Export chat sessions' },
         { method: 'GET', path: '/chatlab/sessions', desc: 'ChatLab 会话发现' },
         { method: 'GET', path: '/chatlab/sessions/:id/messages', desc: 'ChatLab 消息拉取' }
       ],
@@ -259,6 +270,24 @@ class HttpApiService {
     }
   }
 
+  private async getExportGroupMetadata(sessionId?: string, kind?: string): Promise<ExportGroupMetadata | undefined> {
+    if (!sessionId || (kind !== 'group' && !sessionId.includes('@chatroom'))) return undefined
+
+    const groupsResult = await groupAnalyticsService.getGroupChats()
+    if (!groupsResult.success || !groupsResult.data) return undefined
+
+    const group = groupsResult.data.find((item) => item.username === sessionId)
+    if (!group) return undefined
+
+    return {
+      sessionId: group.username,
+      displayName: group.displayName,
+      memberCount: group.memberCount,
+      avatarUrl: group.avatarUrl,
+      sortTimestamp: group.sortTimestamp
+    }
+  }
+
   private failure(requestId: string, code: string, message: string, hint?: string): ApiEnvelopeError {
     return {
       success: false,
@@ -272,8 +301,25 @@ class HttpApiService {
 
   private handleCors(res: http.ServerResponse): void {
     res.setHeader('Access-Control-Allow-Origin', '*')
-    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS')
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+  }
+
+  private async readJsonBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
+    const chunks: Buffer[] = []
+    for await (const chunk of req) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+    }
+
+    if (chunks.length === 0) return {}
+
+    const raw = Buffer.concat(chunks).toString('utf8').trim()
+    if (!raw) return {}
+
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : {}
   }
 
   private extractAuthToken(req: http.IncomingMessage): string {
@@ -358,6 +404,42 @@ class HttpApiService {
     const raw = Number.parseInt(value, 10)
     if (!Number.isFinite(raw) || raw <= 0) return null
     return raw < 1_000_000_000_000 ? raw * 1000 : raw
+  }
+
+  private parseExportTimestamp(value: unknown, endOfDay = false): number | null {
+    if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+      return value < 1_000_000_000_000 ? Math.floor(value) : Math.floor(value / 1000)
+    }
+
+    if (typeof value !== 'string') return null
+
+    const text = value.trim()
+    if (!text) return null
+
+    if (/^\d+$/.test(text)) {
+      const raw = Number.parseInt(text, 10)
+      return Number.isFinite(raw) && raw > 0
+        ? raw < 1_000_000_000_000 ? raw : Math.floor(raw / 1000)
+        : null
+    }
+
+    const localDateTime = text.match(/^(\d{4})-(\d{1,2})-(\d{1,2})(?:[ T](\d{1,2})(?::(\d{1,2})(?::(\d{1,2}))?)?)?$/)
+    if (localDateTime) {
+      const year = Number(localDateTime[1])
+      const month = Number(localDateTime[2]) - 1
+      const day = Number(localDateTime[3])
+      const hasTime = localDateTime[4] !== undefined
+      const hour = hasTime ? Number(localDateTime[4]) : endOfDay ? 23 : 0
+      const minute = hasTime ? Number(localDateTime[5] || 0) : endOfDay ? 59 : 0
+      const second = hasTime ? Number(localDateTime[6] || 0) : endOfDay ? 59 : 0
+      const millisecond = hasTime ? 0 : endOfDay ? 999 : 0
+      const date = new Date(year, month, day, hour, minute, second, millisecond)
+      const time = date.getTime()
+      return Number.isFinite(time) ? Math.floor(time / 1000) : null
+    }
+
+    const parsed = Date.parse(text)
+    return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed / 1000) : null
   }
 
   private normalizeTimestampMs(value: number): number {
@@ -532,13 +614,14 @@ class HttpApiService {
     const requestId = this.createRequestId()
     const method = req.method || 'GET'
 
-    if (method !== 'GET') {
-      this.sendJson(res, 405, this.failure(requestId, 'METHOD_NOT_ALLOWED', 'Only GET is supported'))
-      return
-    }
-
     const url = new URL(req.url || '/', `http://${this.settings.host}:${this.settings.port}`)
     const pathname = url.pathname
+
+    const isExportRoute = pathname === '/v1/export' || pathname === '/api/v1/export'
+    if (method !== 'GET' && !(method === 'POST' && isExportRoute)) {
+      this.sendJson(res, 405, this.failure(requestId, 'METHOD_NOT_ALLOWED', 'Only GET and POST /v1/export are supported'))
+      return
+    }
 
     // 兼容旧路径：无版本前缀时重定向到 /v1
     if (pathname === '/health') {
@@ -597,6 +680,106 @@ class HttpApiService {
         )
         return
       }
+    }
+
+    if (isExportRoute) {
+      if (method !== 'POST') {
+        this.sendJson(res, 405, this.failure(requestId, 'METHOD_NOT_ALLOWED', 'Use POST /v1/export'))
+        return
+      }
+
+      try {
+        const body = await this.readJsonBody(req)
+        const rawArgs = body.args && typeof body.args === 'object' && !Array.isArray(body.args)
+          ? body.args as Record<string, unknown>
+          : body
+        const args: Record<string, unknown> = { ...rawArgs, validateOnly: false }
+
+        const dateRange = args.dateRange
+        if (dateRange && typeof dateRange === 'object' && !Array.isArray(dateRange)) {
+          const range = dateRange as Record<string, unknown>
+          const start = this.parseExportTimestamp(range.start)
+          const end = this.parseExportTimestamp(range.end, true)
+          args.dateRange = {
+            ...range,
+            ...(start ? { start } : {}),
+            ...(end ? { end } : {})
+          }
+        }
+        console.log(`[HTTP API] Export request received with args: ${JSON.stringify(args)}`)
+
+        const result = await executeMcpTool('export_chat', args)
+        const payload = result.payload as {
+          canExport?: boolean
+          success?: boolean
+          error?: string
+          missingFields?: string[]
+          message?: string
+          outputDir?: string
+          outputPath?: string
+          format?: string
+          resolvedSession?: {
+            sessionId: string
+            displayName: string
+            kind: string
+          }
+        }
+
+        if (!payload.canExport) {
+          this.sendJson(
+            res,
+            400,
+            this.failure(
+              requestId,
+              'BAD_REQUEST',
+              payload.message || 'Export request is incomplete.',
+              payload.missingFields?.length
+                ? `Missing fields: ${payload.missingFields.join(', ')}`
+                : undefined
+            )
+          )
+          return
+        }
+
+        if (!payload.success) {
+          this.sendJson(
+            res,
+            500,
+            this.failure(
+              requestId,
+              'EXPORT_FAILED',
+              payload.error || payload.message || 'Export failed'
+            )
+          )
+          return
+        }
+
+        const groupMetadata = await this.getExportGroupMetadata(
+          payload.resolvedSession?.sessionId,
+          payload.resolvedSession?.kind
+        )
+
+        this.sendJson(res, 200, this.success(requestId, {
+          exported: true,
+          outputPath: payload.outputPath,
+          outputDir: payload.outputDir,
+          format: payload.format,
+          resolvedSession: payload.resolvedSession,
+          ...(groupMetadata ? { groupMetadata } : {})
+        }))
+      } catch (error: any) {
+        this.sendJson(
+          res,
+          500,
+          this.failure(
+            requestId,
+            'EXPORT_FAILED',
+            String(error?.message || error || 'Export failed'),
+            typeof error?.hint === 'string' ? error.hint : undefined
+          )
+        )
+      }
+      return
     }
 
     if (pathname === '/v1' || pathname === '/v1/') {
